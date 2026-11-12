@@ -6,7 +6,8 @@ import logging
 import re
 
 from calendar_service import BookingError, private
-from communications import DeliveryFailed, DeliveryUnknown
+from communications import (DeliveryFailed, DeliveryUnknown, InvalidNotificationSnapshot,
+                            load_notification_snapshot)
 
 log = logging.getLogger('offvoice.jobs')
 
@@ -67,6 +68,7 @@ class Jobs:
                         if payload['kind'] not in {'CREATE', 'RESCHEDULE', 'CANCEL'} or not payload['key']:
                             raise ValueError('Invalid queued notification')
                         age = (self.calendar.now() - datetime.fromisoformat(payload['at'])).total_seconds()
+                        load_notification_snapshot(event, payload)
                     except (ValueError, KeyError, TypeError):
                         remove.append(key)
                         needs_review = True
@@ -78,6 +80,11 @@ class Jobs:
                         continue
                     try:
                         self.mailer.appointment(self.calendar, event, payload)
+                    except (InvalidNotificationSnapshot, ValueError):
+                        remove.append(key)
+                        needs_review = True
+                        log.warning('appointment_email_needs_review')
+                        continue
                     except (DeliveryFailed, DeliveryUnknown):
                         log.warning('appointment_email_pending')
                         continue
@@ -89,6 +96,10 @@ class Jobs:
                         props = dict(private(latest))
                         for key in remove:
                             props[key] = None
+                            prefix = 'ov_snap_' + key[len('ov_mail_'):] + '_'
+                            for snapshot_key in list(props):
+                                if snapshot_key.startswith(prefix):
+                                    props[snapshot_key] = None
                         if needs_review:
                             props['ov_review_needed'] = 'yes'
                         props['ov_notify_pending'] = 'yes' if any(k.startswith('ov_mail_') and v for k, v in props.items()) else 'no'

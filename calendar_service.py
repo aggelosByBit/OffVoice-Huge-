@@ -16,6 +16,7 @@ import httplib2
 from google_auth_httplib2 import AuthorizedHttp
 
 from settings import Settings
+from communications import pack_notification_snapshot
 
 
 class BookingError(Exception):
@@ -154,13 +155,34 @@ class CalendarService:
     def _metadata(self, event):
         return {**private(event), 'ov_clinic': self.settings.clinic_id, 'ov_code': self.booking_code(event)}
 
-    def _pending(self, props, action, operation_id, start=''):
+    def _notification_snapshot(self, event, start='', end='', patient_name=None, phone=None, visit_type=None, moved=False):
+        summary = event.get('summary', '')
+        original_name, separator, original_type = summary.partition(' — ')
+        match = re.search(r'^Τηλέφωνο ασθενούς:\s*(.+)$', event.get('description', ''), re.MULTILINE)
+        return {
+            'patient_name': patient_name if patient_name is not None else (original_name if separator else ''),
+            'visit_type': visit_type if visit_type is not None else (original_type if separator else ''),
+            'phone': phone if phone is not None else (match[1].strip() if match else ''),
+            'summary': summary,
+            'start': start or event.get('start', {}).get('dateTime', ''),
+            'end': end or event.get('end', {}).get('dateTime', ''),
+            'previous_start': event.get('start', {}).get('dateTime', '') if moved else '',
+            'previous_end': event.get('end', {}).get('dateTime', '') if moved else '',
+            'booking_code': self.booking_code(event), 'clinic_name': self.settings.clinic_name,
+            'timezone': self.settings.timezone, 'event_id': event['id'], 'calendar_id': self.settings.calendar_id,
+        }
+
+    def _pending(self, props, action, operation_id, start='', snapshot=None):
         queued = [key for key, value in props.items() if key.startswith('ov_mail_') and value]
         if len(queued) >= 20:
             raise BookingError('NOTIFICATION_BACKLOG', 'Υπάρχει προσωρινό πρόβλημα ενημέρωσης της γραμματείας. Παρακαλώ επικοινωνήστε με το ιατρείο.')
         key = 'ov_mail_' + operation_id[:24]
-        payload = json.dumps({'kind': action, 'key': operation_id, 'at': self._stamp(), 'start': start}, separators=(',', ':'))
-        return {**props, 'ov_notify_pending': 'yes', key: payload}
+        payload = {'kind': action, 'key': operation_id, 'at': self._stamp(), 'start': start}
+        chunks = {}
+        if snapshot is not None:
+            chunks, count = pack_notification_snapshot(operation_id, snapshot)
+            payload.update(v=1, snapshot_parts=count)
+        return {**props, **chunks, 'ov_notify_pending': 'yes', key: json.dumps(payload, separators=(',', ':'))}
 
     def _result(self, event, message, action=None):
         return {'ok': True, 'message': message, 'booking_code': self.booking_code(event),
@@ -236,14 +258,16 @@ class CalendarService:
                 raise BookingError('CODE_UNAVAILABLE', 'Προσωρινή αδυναμία παραγωγής κωδικού. Δοκιμάστε ξανά.')
             now = self.now()
             after_hours = now.weekday() not in self.settings.work_days or not self.settings.open_time <= now.time() < self.settings.close_time or now.date().isoformat() in self.settings.closed_dates
-            props = self._pending({'ov_clinic': self.settings.clinic_id, 'ov_code': code, 'ov_state': 'booked',
-                                   'ov_created_at': now.isoformat(), 'ov_after_hours': str(after_hours).lower(),
-                                   'ov_reschedules': '0', 'ov_last_action': operation_id, 'ov_attendance': 'unknown'}, 'CREATE', operation_id, start.isoformat())
+            props = {'ov_clinic': self.settings.clinic_id, 'ov_code': code, 'ov_state': 'booked',
+                     'ov_created_at': now.isoformat(), 'ov_after_hours': str(after_hours).lower(),
+                     'ov_reschedules': '0', 'ov_last_action': operation_id, 'ov_attendance': 'unknown'}
             body = {'id': operation_id, 'summary': f'{name} — {visit_type}',
                     'description': f'🤖 [OffVoice AI] Κωδικός Κράτησης: {code}\nΤηλέφωνο ασθενούς: {phone}',
                     'start': {'dateTime': start.isoformat(), 'timeZone': self.settings.timezone},
                     'end': {'dateTime': end.isoformat(), 'timeZone': self.settings.timezone},
                     'extendedProperties': {'private': props}}
+            snapshot = self._notification_snapshot(body, patient_name=name, phone=phone, visit_type=visit_type)
+            body['extendedProperties']['private'] = self._pending(props, 'CREATE', operation_id, start.isoformat(), snapshot)
             event = service.events().insert(calendarId=self.settings.calendar_id, body=body, sendUpdates='none').execute()
             return self._result(event, 'Το ραντεβού καταχωρήθηκε. Κρατήστε τον κωδικό σας.', 'CREATE')
 
@@ -263,7 +287,8 @@ class CalendarService:
             props.update(ov_last_action=operation_id, ov_modified_at=self._stamp(),
                          ov_reschedules=str(int(props.get('ov_reschedules', '0')) + 1), ov_confirmed_at='',
                          ov_reminder_state='', ov_reminder_date='')
-            props = self._pending(props, 'RESCHEDULE', operation_id, start.isoformat())
+            snapshot = self._notification_snapshot(event, start=start.isoformat(), end=end.isoformat(), moved=True)
+            props = self._pending(props, 'RESCHEDULE', operation_id, start.isoformat(), snapshot)
             event = self._patch(service, event, {'start': {'dateTime': start.isoformat(), 'timeZone': self.settings.timezone},
                                                'end': {'dateTime': end.isoformat(), 'timeZone': self.settings.timezone},
                                                'extendedProperties': {'private': props}})
@@ -278,8 +303,9 @@ class CalendarService:
             if self.read_time(event['start']['dateTime']) < self.now():
                 raise BookingError('PAST_APPOINTMENT', 'Για παρελθοντικό ραντεβού επικοινωνήστε με τη γραμματεία.')
             props.update(ov_state='cancelled', ov_cancelled_at=self._stamp(), ov_last_action=operation_id)
-            props = self._pending(props, 'CANCEL', operation_id, event['start']['dateTime'])
-            # Keep only technical cancellation evidence in Calendar, with no patient contact/reason.
+            snapshot = self._notification_snapshot(event)
+            props = self._pending(props, 'CANCEL', operation_id, event['start']['dateTime'], snapshot)
+            # Scrub visible details now. Private email snapshots are removed after delivery or timeout.
             event = self._patch(service, event, {'summary': 'Ακυρωμένο ραντεβού · OffVoice AI',
                                                'description': 'Ακυρωμένη κράτηση OffVoice AI. Δεν δεσμεύει διαθεσιμότητα.',
                                                'transparency': 'transparent', 'extendedProperties': {'private': props}})
