@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let busy = false;
+let busy = true;
 let failedRequest = null;
 
 function append(text, role) {
@@ -86,10 +86,12 @@ $('callback').addEventListener('change', async () => {
     if (!response.ok) throw new Error();
     const config = await response.json();
     $('clinic').textContent = config.clinic_name + (config.demo ? ' · Demo' : '');
+    $('privacySummary').textContent = config.privacy_summary;
     $('privacyNotice').textContent = config.privacy_notice;
     $('retention').textContent = `Το ιστορικό παραμένει προσωρινά στον server και διαγράφεται αυτόματα μετά από περίπου ${config.session_minutes} λεπτά αδράνειας. Δεν επανεμφανίζεται μετά από ανανέωση της σελίδας.`;
     $('callbackInfo').textContent = `Αν επιλεγεί, όνομα και τηλέφωνο που θα δώσετε μπορούν να σταλούν με email στο ιατρείο μετά από περίπου ${config.abandoned_minutes} λεπτά αδράνειας. Μην γράφετε αναλυτικό ιατρικό ιστορικό.`;
     $('message').maxLength = config.max_message_chars;
     append('Γεια σας! Είμαι η ψηφιακή γραμματεία. Πώς μπορώ να σας εξυπηρετήσω;', 'bot');
+    setBusy(false);
   } catch (error) { $('status').textContent = 'Αδυναμία φόρτωσης. Παρακαλώ ανανεώστε τη σελίδα.'; }
 })();

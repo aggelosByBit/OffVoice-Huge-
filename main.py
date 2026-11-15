@@ -1,9 +1,11 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
 import hashlib
+from html import escape
 import json
 import logging
 from pathlib import Path
+import re
 from uuid import UUID, uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
@@ -141,10 +143,29 @@ def create_app(settings=None, calendar=None, llm=None, mailer=None, sms=None, st
 
     @app.get('/config')
     async def public_config():
+        summary = ('Δοκιμή με εικονικά στοιχεία. Συνομιλείτε με βοηθό AI που χρησιμοποιεί εξωτερικούς παρόχους. Μην καταχωρίζετε πραγματικά στοιχεία ασθενών.'
+                   if cfg.demo else
+                   f'Συνομιλείτε με τον βοηθό AI του {cfg.clinic_name}. Τα στοιχεία σας χρησιμοποιούνται για ραντεβού μέσω εξωτερικών παρόχων AI, ημερολογίου και email. Μην στέλνετε εξετάσεις ή αναλυτικό ιατρικό ιστορικό.')
         return {'clinic_name': cfg.clinic_name, 'clinic_phone': cfg.clinic_phone, 'demo': cfg.demo,
-                'privacy_notice': cfg.privacy_notice or 'Δοκιμαστική λειτουργία: χρησιμοποιήστε αποκλειστικά εικονικά στοιχεία.',
+                'privacy_summary': summary,
+                'privacy_notice': cfg.privacy_notice or ('Χρησιμοποιήστε αποκλειστικά εικονικά στοιχεία.' if cfg.demo else 'Τα απαραίτητα στοιχεία χρησιμοποιούνται για τη διαχείριση ραντεβού και την επικοινωνία με τη γραμματεία. Αναλυτικές πληροφορίες και δικαιώματα στη σελίδα προσωπικών δεδομένων.'),
                 'session_minutes': cfg.session_seconds // 60, 'abandoned_minutes': cfg.abandoned_seconds // 60,
                 'max_message_chars': cfg.max_message_chars}
+
+    @app.get('/privacy', response_class=HTMLResponse)
+    async def privacy():
+        # Reading the notice must not require or create a chat session.
+        values = {
+            'CLINIC_NAME': cfg.clinic_name,
+            'SESSION_MINUTES': str(cfg.session_seconds // 60),
+            'ABANDONED_MINUTES': str(cfg.abandoned_seconds // 60),
+            'CLINIC_NOTICE': cfg.privacy_notice or 'Δεν έχει συμπληρωθεί ειδική ενημέρωση ιατρείου.',
+            'CONTEXT_NOTICE': ('Η λειτουργία Demo χρησιμοποιεί προσομοιωμένες υπηρεσίες και μόνο εικονικά στοιχεία.'
+                               if cfg.demo else
+                               'Η ενημέρωση αφορά τη διαχείριση αιτημάτων ραντεβού μέσω βοηθού AI. Για πληροφορίες και άσκηση δικαιωμάτων απευθυνθείτε στο ιατρείο.'),
+        }
+        template = (BASE_DIR / 'static' / 'privacy.html').read_text()
+        return re.sub(r'\{\{([A-Z_]+)\}\}', lambda m: escape(values[m[1]]), template)
 
     @app.get('/health')
     async def health():
